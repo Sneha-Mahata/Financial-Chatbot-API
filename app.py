@@ -7,11 +7,16 @@ import os
 import json
 import dill
 import uvicorn
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime
+
+# Import all required LangChain and LangGraph components
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
 from langgraph.graph import END, StateGraph
-# Add missing imports needed by the loaded functions
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.vectorstores import Chroma
@@ -44,6 +49,196 @@ class ChatResponse(BaseModel):
 chatbot = None
 AgentState = None
 functions = None
+retriever = None  # Initialize retriever as None
+
+# Define RAG setup function (similar to Kaggle version but adapted for deployment)
+def setup_rag_system():
+    print("Setting up RAG system with existing knowledge base...")
+    
+    # Paths adjusted for deployment environment
+    embeddings_path = "embeddings"
+    chroma_path = "knowledge_base/chromadb"
+    
+    # Create model instance
+    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+    
+    # Create embedding function
+    try:
+        embeddings = OpenAIEmbeddings()
+        print("Using OpenAI embeddings")
+    except Exception as e:
+        # Fall back to local embeddings if OpenAI fails
+        try:
+            print("OpenAI embeddings failed, trying SentenceTransformers")
+            embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+        except Exception as e2:
+            print(f"Could not initialize embeddings: {str(e2)}")
+            return None
+    
+    # Check if the knowledge base directory exists
+    if not os.path.exists(chroma_path):
+        print(f"Warning: Knowledge base path {chroma_path} does not exist.")
+        return None
+    
+    # Attempt to load the existing vector store
+    try:
+        # Specify the embedding function when loading
+        vectorstore = Chroma(
+            persist_directory=chroma_path,
+            embedding_function=embeddings
+        )
+        print(f"Successfully loaded Chroma from {chroma_path}")
+        
+        # Create base retriever with similarity search
+        base_retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 5}
+        )
+        
+        # Create compressor for more focused retrieval
+        compressor = LLMChainExtractor.from_llm(llm)
+        
+        # Create compressed retriever
+        retriever = ContextualCompressionRetriever(
+            base_compressor=compressor,
+            base_retriever=base_retriever
+        )
+        
+        return retriever
+    
+    except Exception as e:
+        print(f"Error loading vector store: {str(e)}")
+        return None
+
+# FINANCIAL TOOLS
+
+# Stock Price Tool
+def get_stock_price(ticker: str) -> Dict[str, Any]:
+    """Get the current price and information for a stock."""
+    try:
+        ticker = ticker.strip().upper()
+        stock = yf.Ticker(ticker)
+        data = stock.history(period="1d")
+        
+        if data.empty:
+            return {
+                "status": "error",
+                "message": f"Could not find data for ticker symbol {ticker}."
+            }
+        
+        # Get company info
+        info = stock.info
+        company_name = info.get('shortName', ticker)
+        
+        # Format the response
+        latest_price = data['Close'].iloc[-1]
+        open_price = data['Open'].iloc[0]
+        
+        # Calculate change
+        change = latest_price - open_price
+        percent_change = (change / open_price) * 100
+        
+        return {
+            "status": "success",
+            "data": {
+                "company": company_name,
+                "ticker": ticker,
+                "current_price": latest_price,
+                "open_price": open_price,
+                "change": change,
+                "percent_change": percent_change,
+                "date": datetime.now().strftime('%Y-%m-%d %H:%M')
+            },
+            "message": f"Retrieved stock data for {company_name} ({ticker})"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error retrieving stock data for {ticker}: {str(e)}"
+        }
+
+# Financial Calculator Tool
+def financial_calculator(calculation_type: str, parameters: Dict[str, float]) -> Dict[str, Any]:
+    """Perform financial calculations."""
+    try:
+        if calculation_type.lower() == "compound_interest":
+            # Get parameters
+            principal = parameters.get("principal")
+            rate = parameters.get("rate") / 100  # Convert percentage to decimal
+            time = parameters.get("time")
+            
+            if principal is None or rate is None or time is None:
+                return {
+                    "status": "error",
+                    "message": "Missing required parameters. Need principal, rate, and time."
+                }
+            
+            # Compound interest formula: A = P(1 + r)^t
+            amount = principal * (1 + rate) ** time
+            interest = amount - principal
+            
+            return {
+                "status": "success",
+                "data": {
+                    "calculation_type": "compound_interest",
+                    "principal": principal,
+                    "rate": rate * 100,
+                    "time": time,
+                    "final_amount": amount,
+                    "interest_earned": interest
+                },
+                "message": "Compound interest calculation completed."
+            }
+                
+        elif calculation_type.lower() == "loan_payment":
+            # Get parameters and calculate monthly payment
+            principal = parameters.get("principal")
+            rate = parameters.get("rate") / 100
+            time = parameters.get("time")
+            
+            if principal is None or rate is None or time is None:
+                return {
+                    "status": "error",
+                    "message": "Missing required parameters. Need principal, rate, and time."
+                }
+            
+            # Monthly rate and number of payments
+            monthly_rate = rate / 12
+            num_payments = time * 12
+            
+            # Monthly payment formula: P = (r*PV)/(1-(1+r)^-n)
+            if monthly_rate == 0:
+                monthly_payment = principal / num_payments
+            else:
+                monthly_payment = (monthly_rate * principal) / (1 - (1 + monthly_rate) ** -num_payments)
+            
+            total_paid = monthly_payment * num_payments
+            total_interest = total_paid - principal
+            
+            return {
+                "status": "success",
+                "data": {
+                    "calculation_type": "loan_payment",
+                    "loan_amount": principal,
+                    "interest_rate": rate * 100,
+                    "loan_term_years": time,
+                    "monthly_payment": monthly_payment,
+                    "total_paid": total_paid,
+                    "total_interest": total_interest
+                },
+                "message": "Loan payment calculation completed."
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"Unsupported calculation type: {calculation_type}. Supported types are: compound_interest, loan_payment"
+            }
+    
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error performing financial calculation: {str(e)}"
+        }
 
 # Helper functions to convert between API message format and internal format
 def convert_to_internal_messages(api_messages):
@@ -70,10 +265,14 @@ def convert_to_api_messages(internal_messages):
 
 # Load the chatbot components
 def load_chatbot():
-    global chatbot, AgentState, functions
+    global chatbot, AgentState, functions, retriever
     
     # Set your OpenAI API key from environment variable
     os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+    
+    # Initialize the retriever if it hasn't been already
+    if retriever is None:
+        retriever = setup_rag_system()
     
     try:
         # Load the configuration
@@ -126,7 +325,7 @@ def load_chatbot():
 # Chat endpoint
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    global chatbot, AgentState
+    global chatbot, AgentState, retriever
     
     if chatbot is None:
         success = load_chatbot()
@@ -161,6 +360,45 @@ async def chat(request: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in chat processing: {str(e)}")
 
+# Simplified endpoint for basic responses (backup if the main chatbot fails)
+@app.post("/simple-chat", response_model=ChatResponse)
+async def simple_chat(request: ChatRequest):
+    # Initialize a basic OpenAI chat model
+    try:
+        # Set your OpenAI API key
+        os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+        
+        # Create a simple OpenAI chat model
+        llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.2)
+        
+        # Convert API message format to internal format
+        message_history = [] if not request.history else convert_to_internal_messages(request.history)
+        
+        # Create system message
+        system_msg = SystemMessage(content="""You are a financial advisor bot that helps users with financial questions. 
+        You can provide information about investments, stocks, financial planning, and calculations. 
+        Be professional but conversational in your responses.""")
+        
+        # Prepare messages for the model
+        messages = [system_msg] + message_history + [HumanMessage(content=request.message)]
+        
+        # Get response
+        response = llm.invoke(messages)
+        
+        # Update message history
+        updated_messages = message_history + [
+            HumanMessage(content=request.message),
+            AIMessage(content=response.content)
+        ]
+        
+        # Convert back to API format
+        updated_history = convert_to_api_messages(updated_messages)
+        
+        return ChatResponse(response=response.content, history=updated_history)
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error in simple chat: {str(e)}")
+
 # Health check endpoint
 @app.get("/health")
 async def health_check():
@@ -169,6 +407,11 @@ async def health_check():
 # Initialize the chatbot on startup
 @app.on_event("startup")
 async def startup_event():
+    global retriever
+    # Initialize the retriever
+    retriever = setup_rag_system()
+    
+    # Load the chatbot
     success = load_chatbot()
     if not success:
         print("Warning: Failed to load chatbot on startup. Will attempt to load on first request.")
