@@ -11,6 +11,13 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
 from langgraph.graph import END, StateGraph
+# Add missing imports needed by the loaded functions
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.vectorstores import Chroma
+from langchain_core.runnables import RunnableLambda
+from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
 
 # Initialize FastAPI app
 app = FastAPI(title="Financial Advisor Chatbot API")
@@ -168,5 +175,5 @@ async def startup_event():
 
 # Run the server
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 10000))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
